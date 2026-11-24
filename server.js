@@ -316,30 +316,31 @@ app.post(
       }
 
       const gateway = await zapupiRequest(CREATE_URL, payload);
-
+      console.log('ZapUPI create-order response:', JSON.stringify(gateway));
+     const paymentUrl = gateway.payment_url || gateway.data?.payment_url || '';
       if (
         gateway.status !== 'success' ||
-        !gateway.payment_url
+        !paymentUrl
       ) {
         await orderRef.update({ status: 'failed' });
 
         return errorResponse(
           res,
           502,
-          'ZapUPI payment link was not received'
+         gateway.message || 'ZapUPI payment link was not received' 
         );
       }
 
       await orderRef.update({
         status: 'pending',
-        paymentUrl: gateway.payment_url,
+        paymentUrl
         txnId: gateway.txn_id || ''
       });
 
       res.json({
         status: 'success',
         order_id: orderId,
-        payment_url: gateway.payment_url
+        paymentUrl
       });
 
     } catch (error) {
