@@ -330,12 +330,12 @@ app.post(
          gateway.message || 'ZapUPI payment link was not received' 
         );
       }
-
-      await orderRef.update({
+  await orderRef.update({
         status: 'pending',
-        paymentUrl
+        paymentUrl: paymentUrl,
         txnId: gateway.txn_id || ''
       });
+      
 
       res.json({
         status: 'success',
