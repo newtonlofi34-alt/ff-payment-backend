@@ -52,6 +52,7 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
 app.use('/api/', rateLimit({
   windowMs: 60000,
@@ -82,7 +83,6 @@ async function authenticate(req, res, next) {
 
     req.user = await admin.auth().verifyIdToken(match[1]);
     next();
-
   } catch (error) {
     return errorResponse(res, 401, 'Invalid login token');
   }
@@ -108,13 +108,13 @@ async function zapupiRequest(url, body) {
 }
 
 function normalizeStatus(value) {
-  const status = String(value || '').toLowerCase();
+  const status = String(value || '').trim().toLowerCase();
 
-  if (['success', 'successful', 'paid'].includes(status)) {
+  if (['success', 'successful', 'paid', 'completed'].includes(status)) {
     return 'success';
   }
 
-  if (['failed', 'failure', 'cancelled', 'canceled'].includes(status)) {
+  if (['failed', 'failure', 'cancelled', 'canceled', 'expired'].includes(status)) {
     return 'failed';
   }
 
@@ -128,7 +128,7 @@ async function verifyPayment(orderId) {
   });
 
   if (result.status !== 'success' || !result.data) {
-    throw new Error('Payment verification failed');
+    throw new Error(result.message || 'Payment verification failed');
   }
 
   return result.data;
@@ -136,58 +136,62 @@ async function verifyPayment(orderId) {
 
 async function creditWallet(orderId, order, payment) {
   const expectedAmount = Number(order.amount);
-  const paidAmount = Number(payment.amount);
+  const paidAmount = payment.amount !== undefined && payment.amount !== null && payment.amount !== ''
+    ? Number(payment.amount)
+    : expectedAmount;
 
-  if (
-    !Number.isFinite(paidAmount) ||
-    Math.abs(paidAmount - expectedAmount) > 0.009
-  ) {
-    throw new Error('Payment amount mismatch');
+  if (!Number.isFinite(expectedAmount) || expectedAmount <= 0) {
+    throw new Error('Invalid order amount');
+  }
+
+  if (!Number.isFinite(paidAmount) || Math.abs(paidAmount - expectedAmount) > 0.009) {
+    throw new Error(`Payment amount mismatch: expected ${expectedAmount}, got ${paidAmount}`);
   }
 
   const userRef = db.ref(`users/${order.uid}`);
-
-  const transaction = await userRef.transaction(profile => {
-    if (!profile) return;
-
-    profile.processedZapupiOrders =
-      profile.processedZapupiOrders || {};
-
-    if (profile.processedZapupiOrders[orderId]) {
-      return profile;
-    }
-
-    profile.balance =
-      Number(profile.balance || 0) + expectedAmount;
-
-    profile.processedZapupiOrders[orderId] = true;
-
-    return profile;
-  });
-
-  const profile = transaction.snapshot.val();
-
-  if (
-    !profile ||
-    !profile.processedZapupiOrders ||
-    !profile.processedZapupiOrders[orderId]
-  ) {
-    throw new Error('Wallet credit failed');
+  const userSnap = await userRef.get();
+  if (!userSnap.exists()) {
+    throw new Error(`Target user not found: ${order.uid}`);
   }
 
-  await db.ref(
-    `transactions/${order.uid}/zapupi_${orderId}`
-  ).set({
-    type: 'deposit',
-    amount: expectedAmount,
-    description: 'ZapUPI Wallet Recharge',
-    timestamp: admin.database.ServerValue.TIMESTAMP,
-    details: {
-      orderId,
-      txnId: payment.txn_id || '',
-      utr: payment.utr || ''
+  // Step 1: Claim order idempotently so double webhook/status calls never double-credit
+  const claimRef = db.ref(`zapupiProcessedOrders/${orderId}`);
+  const claimResult = await claimRef.transaction(current => {
+    if (current) {
+      return; // Already claimed/processed
     }
+    return {
+      uid: order.uid,
+      amount: expectedAmount,
+      claimedAt: admin.database.ServerValue.TIMESTAMP
+    };
   });
+
+  const alreadyProcessed = !claimResult.committed;
+
+  // Step 2: Atomically add expectedAmount to user's balance if not already credited
+  if (!alreadyProcessed) {
+    const balanceRef = db.ref(`users/${order.uid}/balance`);
+    const balanceTx = await balanceRef.transaction(currentBalance => {
+      return Number(currentBalance || 0) + expectedAmount;
+    });
+
+    if (!balanceTx.committed) {
+      throw new Error('Balance transaction did not commit');
+    }
+
+    await db.ref(`transactions/${order.uid}/zapupi_${orderId}`).set({
+      type: 'deposit',
+      amount: expectedAmount,
+      description: 'ZapUPI Wallet Recharge',
+      timestamp: admin.database.ServerValue.TIMESTAMP,
+      details: {
+        orderId,
+        txnId: payment.txn_id || '',
+        utr: payment.utr || ''
+      }
+    });
+  }
 
   await db.ref(`zapupiOrders/${orderId}`).update({
     status: 'success',
@@ -200,14 +204,12 @@ async function creditWallet(orderId, order, payment) {
 
   return {
     credited: true,
-    alreadyCredited: !transaction.committed
+    alreadyCredited: alreadyProcessed
   };
 }
 
 async function processOrder(orderId) {
-  const orderSnap = await db.ref(
-    `zapupiOrders/${orderId}`
-  ).get();
+  const orderSnap = await db.ref(`zapupiOrders/${orderId}`).get();
 
   if (!orderSnap.exists()) {
     throw new Error('Order not found');
@@ -317,35 +319,33 @@ app.post(
 
       const gateway = await zapupiRequest(CREATE_URL, payload);
       console.log('ZapUPI create-order response:', JSON.stringify(gateway));
-     const paymentUrl = gateway.payment_url || gateway.data?.payment_url || '';
-      if (
-        gateway.status !== 'success' ||
-        !paymentUrl
-      ) {
+
+      const paymentUrl = gateway.payment_url || gateway.data?.payment_url || '';
+
+      if (gateway.status !== 'success' || !paymentUrl) {
         await orderRef.update({ status: 'failed' });
 
         return errorResponse(
           res,
           502,
-         gateway.message || 'ZapUPI payment link was not received' 
+          gateway.message || 'ZapUPI payment link was not received'
         );
       }
-  await orderRef.update({
+
+      await orderRef.update({
         status: 'pending',
-        paymentUrl: paymentUrl,
+        paymentUrl,
         txnId: gateway.txn_id || ''
       });
-      
 
       res.json({
         status: 'success',
         order_id: orderId,
+        payment_url: paymentUrl,
         paymentUrl
       });
-
     } catch (error) {
       console.error('Create order error:', error.message);
-
       errorResponse(res, 502, 'Unable to create payment order');
     }
   }
@@ -362,9 +362,7 @@ app.get(
         return errorResponse(res, 400, 'Invalid order ID');
       }
 
-      const snap = await db.ref(
-        `zapupiOrders/${orderId}`
-      ).get();
+      const snap = await db.ref(`zapupiOrders/${orderId}`).get();
 
       if (!snap.exists()) {
         return errorResponse(res, 404, 'Order not found');
@@ -376,31 +374,28 @@ app.get(
 
       const result = await processOrder(orderId);
       res.json(result);
-
     } catch (error) {
       console.error('Status error:', error.message);
-
       errorResponse(res, 502, 'Payment verification unavailable');
     }
   }
 );
 
 app.post('/api/zapupi/webhook', async (req, res) => {
-  const orderId = String(req.body.order_id || '');
+  const orderId = String(req.body.order_id || req.body.orderId || '');
 
   if (!orderId) {
     return res.status(200).json({ status: 'ok' });
   }
 
   try {
-    const snap = await db.ref(
-      `zapupiOrders/${orderId}`
-    ).get();
+    const snap = await db.ref(`zapupiOrders/${orderId}`).get();
 
     if (snap.exists()) {
       await processOrder(orderId);
+    } else {
+      console.warn('Webhook received for unknown orderId:', orderId);
     }
-
   } catch (error) {
     console.error('Webhook error:', error.message);
   }
