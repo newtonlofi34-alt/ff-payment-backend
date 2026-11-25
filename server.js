@@ -68,6 +68,7 @@ const RETURN_URL = process.env.APP_RETURN_URL || '';
 function errorResponse(res, code, message) {
   return res.status(code).json({
     status: 'error',
+    success: false,
     message
   });
 }
@@ -380,6 +381,130 @@ app.get(
     }
   }
 );
+
+app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const amount = Number(req.body.amount);
+    const upiId = String(req.body.upiId || req.body.accountInfo || '').trim();
+    const withdrawalId = String(req.body.withdrawalId || '').trim();
+    const method = String(req.body.method || 'UPI').trim();
+
+    if (!Number.isFinite(amount) || amount < 10 || amount > 100000) {
+      return errorResponse(res, 400, 'Invalid withdrawal amount');
+    }
+
+    if (!upiId || !upiId.includes('@')) {
+      return errorResponse(res, 400, 'Valid UPI ID is required');
+    }
+
+    if (!process.env.PAYOUT_API_URL || !process.env.PAYOUT_API_KEY) {
+      return errorResponse(
+        res,
+        501,
+        'Payout gateway credentials are not configured on server'
+      );
+    }
+
+    const payoutKey = withdrawalId || `WD_${uid}_${Date.now()}`;
+    const claimRef = db.ref(`payoutProcessedWithdrawals/${payoutKey}`);
+    const claimResult = await claimRef.transaction(current => {
+      if (current) {
+        return;
+      }
+      return {
+        uid,
+        amount,
+        upiId,
+        claimedAt: admin.database.ServerValue.TIMESTAMP
+      };
+    });
+
+    if (!claimResult.committed) {
+      return errorResponse(res, 409, 'Withdrawal payout is already being processed');
+    }
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.PAYOUT_API_KEY}`,
+      'X-Client-Id': process.env.PAYOUT_API_KEY
+    };
+
+    if (process.env.PAYOUT_SECRET_KEY) {
+      headers['X-Client-Secret'] = process.env.PAYOUT_SECRET_KEY;
+    }
+
+    const payoutResponse = await fetch(process.env.PAYOUT_API_URL, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        transfer_id: payoutKey,
+        order_id: payoutKey,
+        uid,
+        amount,
+        upi_id: upiId,
+        vpa: upiId,
+        method,
+        remark: `Tournament withdrawal ${payoutKey}`
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+
+    const payoutData = await payoutResponse.json().catch(() => ({}));
+
+    if (!payoutResponse.ok || payoutData.success === false || payoutData.status === 'error') {
+      await claimRef.remove();
+      if (withdrawalId) {
+        await db.ref(`withdrawals/${withdrawalId}`).update({
+          status: 'failed',
+          failureReason: payoutData.message || 'Payout gateway transfer failed',
+          updatedAt: admin.database.ServerValue.TIMESTAMP
+        });
+      }
+      return errorResponse(
+        res,
+        502,
+        payoutData.message || 'UPI transfer failed'
+      );
+    }
+
+    const rawStatus = String(
+      payoutData.status || payoutData.data?.status || 'completed'
+    ).toLowerCase();
+    const normalizedPayoutStatus = ['pending', 'processing', 'queued'].includes(rawStatus)
+      ? 'processing'
+      : 'completed';
+
+    const utr =
+      payoutData.utr ||
+      payoutData.data?.utr ||
+      payoutData.rrn ||
+      payoutData.data?.rrn ||
+      payoutData.payout_id ||
+      payoutData.reference_id ||
+      '';
+
+    if (withdrawalId) {
+      await db.ref(`withdrawals/${withdrawalId}`).update({
+        status: normalizedPayoutStatus,
+        utr,
+        payoutResponse: payoutData,
+        updatedAt: admin.database.ServerValue.TIMESTAMP,
+        completedAt: admin.database.ServerValue.TIMESTAMP
+      });
+    }
+
+    return res.json({
+      success: true,
+      status: normalizedPayoutStatus,
+      utr,
+      payout_id: payoutData.payout_id || payoutData.reference_id || payoutKey
+    });
+  } catch (error) {
+    console.error('Payout withdraw error:', error.message);
+    return errorResponse(res, 502, 'Unable to process UPI payout');
+  }
+});
 
 app.post('/api/zapupi/webhook', async (req, res) => {
   const orderId = String(req.body.order_id || req.body.orderId || '');
