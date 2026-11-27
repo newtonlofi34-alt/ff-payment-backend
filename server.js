@@ -65,6 +65,13 @@ const STATUS_URL = 'https://pay.zapupi.com/api/order-status';
 const BASE_URL = process.env.PUBLIC_BASE_URL.replace(/\/$/, '');
 const RETURN_URL = process.env.APP_RETURN_URL || '';
 
+// 0.25% GST Configuration
+const GST_RATE = 0.0025; // 0.25%
+
+function calculateGst(amount) {
+  return Number((amount * GST_RATE).toFixed(2));
+}
+
 function errorResponse(res, code, message) {
   return res.status(code).json({
     status: 'error',
@@ -136,17 +143,21 @@ async function verifyPayment(orderId) {
 }
 
 async function creditWallet(orderId, order, payment) {
-  const expectedAmount = Number(order.amount);
+  // Wallet mein credit hone wala base amount
+  const walletCreditAmount = Number(order.baseAmount || order.amount);
+  // Gateway par pay kiya gaya total amount (Base + 0.25% GST)
+  const expectedPayableAmount = Number(order.totalPayableAmount || order.amount);
+
   const paidAmount = payment.amount !== undefined && payment.amount !== null && payment.amount !== ''
     ? Number(payment.amount)
-    : expectedAmount;
+    : expectedPayableAmount;
 
-  if (!Number.isFinite(expectedAmount) || expectedAmount <= 0) {
+  if (!Number.isFinite(walletCreditAmount) || walletCreditAmount <= 0) {
     throw new Error('Invalid order amount');
   }
 
-  if (!Number.isFinite(paidAmount) || Math.abs(paidAmount - expectedAmount) > 0.009) {
-    throw new Error(`Payment amount mismatch: expected ${expectedAmount}, got ${paidAmount}`);
+  if (!Number.isFinite(paidAmount) || Math.abs(paidAmount - expectedPayableAmount) > 0.009) {
+    throw new Error(`Payment amount mismatch: expected ${expectedPayableAmount}, got ${paidAmount}`);
   }
 
   const userRef = db.ref(`users/${order.uid}`);
@@ -163,18 +174,20 @@ async function creditWallet(orderId, order, payment) {
     }
     return {
       uid: order.uid,
-      amount: expectedAmount,
+      baseAmount: walletCreditAmount,
+      gstAmount: order.gstAmount || 0,
+      paidAmount: expectedPayableAmount,
       claimedAt: admin.database.ServerValue.TIMESTAMP
     };
   });
 
   const alreadyProcessed = !claimResult.committed;
 
-  // Step 2: Atomically add expectedAmount to user's balance if not already credited
+  // Step 2: Atomically add walletCreditAmount to user's balance if not already credited
   if (!alreadyProcessed) {
     const balanceRef = db.ref(`users/${order.uid}/balance`);
     const balanceTx = await balanceRef.transaction(currentBalance => {
-      return Number(currentBalance || 0) + expectedAmount;
+      return Number(currentBalance || 0) + walletCreditAmount;
     });
 
     if (!balanceTx.committed) {
@@ -183,8 +196,10 @@ async function creditWallet(orderId, order, payment) {
 
     await db.ref(`transactions/${order.uid}/zapupi_${orderId}`).set({
       type: 'deposit',
-      amount: expectedAmount,
-      description: 'ZapUPI Wallet Recharge',
+      amount: walletCreditAmount,
+      gstAmount: order.gstAmount || 0,
+      totalPaid: expectedPayableAmount,
+      description: 'ZapUPI Wallet Recharge (0.25% GST applied)',
       timestamp: admin.database.ServerValue.TIMESTAMP,
       details: {
         orderId,
@@ -260,13 +275,13 @@ app.post(
   authenticate,
   async (req, res) => {
     try {
-      const amount = Number(req.body.amount);
+      const baseAmount = Number(req.body.amount);
 
       if (
-        !Number.isFinite(amount) ||
-        amount < 10 ||
-        amount > 1000 ||
-        Math.round(amount * 100) !== amount * 100
+        !Number.isFinite(baseAmount) ||
+        baseAmount < 10 ||
+        baseAmount > 1000 ||
+        Math.round(baseAmount * 100) !== baseAmount * 100
       ) {
         return errorResponse(
           res,
@@ -274,6 +289,10 @@ app.post(
           'Amount must be between 10 and 1000'
         );
       }
+
+      // 0.25% GST Calculation for Deposit
+      const gstAmount = calculateGst(baseAmount);
+      const totalPayableAmount = Number((baseAmount + gstAmount).toFixed(2));
 
       const uid = req.user.uid;
 
@@ -286,7 +305,11 @@ app.post(
 
       await orderRef.set({
         uid,
-        amount,
+        amount: totalPayableAmount,
+        baseAmount,
+        gstAmount,
+        gstRate: '0.25%',
+        totalPayableAmount,
         status: 'creating',
         credited: false,
         createdAt: admin.database.ServerValue.TIMESTAMP
@@ -295,8 +318,8 @@ app.post(
       const payload = {
         zap_key: process.env.ZAPUPI_ZAP_KEY,
         order_id: orderId,
-        amount: String(amount),
-        remark: `Wallet recharge ${uid}`,
+        amount: String(totalPayableAmount), // Gateway ko GST ke saath total amount bhejenge
+        remark: `Wallet recharge ${uid} (Incl 0.25% GST)`,
         webhook_url: `${BASE_URL}/api/zapupi/webhook`
       };
 
@@ -342,6 +365,9 @@ app.post(
       res.json({
         status: 'success',
         order_id: orderId,
+        base_amount: baseAmount,
+        gst_amount: gstAmount,
+        total_payable: totalPayableAmount,
         payment_url: paymentUrl,
         paymentUrl
       });
@@ -382,8 +408,6 @@ app.get(
   }
 );
 
-const WITHDRAWAL_GST_RATE = Number(process.env.WITHDRAWAL_GST_RATE || 0.18);
-
 app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -408,22 +432,12 @@ app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
       );
     }
 
-    // Read GST rate from Firebase settings if configured, else fallback to env/default 18%
-    let gstRate = WITHDRAWAL_GST_RATE;
-    try {
-      const gstSnap = await db.ref('settings/withdrawalGstPercent').get();
-      if (gstSnap.exists() && Number.isFinite(Number(gstSnap.val()))) {
-        gstRate = Number(gstSnap.val()) / 100;
-      }
-    } catch (e) {
-      console.warn('Could not read withdrawalGstPercent from DB, using default:', gstRate);
-    }
-
-    const gstAmount = Number((requestedAmount * gstRate).toFixed(2));
+    // 0.25% GST Deduction on Withdrawal
+    const gstAmount = calculateGst(requestedAmount);
     const netPayoutAmount = Number((requestedAmount - gstAmount).toFixed(2));
 
     if (netPayoutAmount <= 0) {
-      return errorResponse(res, 400, 'Net payout amount after GST must be greater than 0');
+      return errorResponse(res, 400, 'Net payout amount too low after GST deduction');
     }
 
     const payoutKey = withdrawalId || `WD_${uid}_${Date.now()}`;
@@ -435,7 +449,6 @@ app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
       return {
         uid,
         requestedAmount,
-        gstRate,
         gstAmount,
         netPayoutAmount,
         upiId,
@@ -464,13 +477,11 @@ app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
         transfer_id: payoutKey,
         order_id: payoutKey,
         uid,
-        amount: netPayoutAmount,
-        gross_amount: requestedAmount,
-        gst_amount: gstAmount,
+        amount: netPayoutAmount, // 0.25% GST katne ke baad net amount transfer hoga
         upi_id: upiId,
         vpa: upiId,
         method,
-        remark: `Tournament withdrawal ${payoutKey} (Net after GST)`
+        remark: `Tournament withdrawal ${payoutKey} (Net after 0.25% GST)`
       }),
       signal: AbortSignal.timeout(15000)
     });
@@ -513,8 +524,8 @@ app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
       await db.ref(`withdrawals/${withdrawalId}`).update({
         status: normalizedPayoutStatus,
         requestedAmount,
-        gstRatePercent: Number((gstRate * 100).toFixed(2)),
         gstAmount,
+        gstRate: '0.25%',
         netPayoutAmount,
         utr,
         payoutResponse: payoutData,
@@ -526,10 +537,9 @@ app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
     return res.json({
       success: true,
       status: normalizedPayoutStatus,
-      requestedAmount,
-      gstRatePercent: Number((gstRate * 100).toFixed(2)),
-      gstAmount,
-      netPayoutAmount,
+      requested_amount: requestedAmount,
+      gst_amount: gstAmount,
+      net_payout_amount: netPayoutAmount,
       utr,
       payout_id: payoutData.payout_id || payoutData.reference_id || payoutKey
     });
