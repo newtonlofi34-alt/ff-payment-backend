@@ -1,4 +1,4 @@
-require('dotenv').config();
+ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
@@ -382,15 +382,17 @@ app.get(
   }
 );
 
+const WITHDRAWAL_GST_RATE = Number(process.env.WITHDRAWAL_GST_RATE || 0.18);
+
 app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
   try {
     const uid = req.user.uid;
-    const amount = Number(req.body.amount);
+    const requestedAmount = Number(req.body.amount);
     const upiId = String(req.body.upiId || req.body.accountInfo || '').trim();
     const withdrawalId = String(req.body.withdrawalId || '').trim();
     const method = String(req.body.method || 'UPI').trim();
 
-    if (!Number.isFinite(amount) || amount < 10 || amount > 100000) {
+    if (!Number.isFinite(requestedAmount) || requestedAmount < 10 || requestedAmount > 100000) {
       return errorResponse(res, 400, 'Invalid withdrawal amount');
     }
 
@@ -406,6 +408,24 @@ app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
       );
     }
 
+    // Read GST rate from Firebase settings if configured, else fallback to env/default 18%
+    let gstRate = WITHDRAWAL_GST_RATE;
+    try {
+      const gstSnap = await db.ref('settings/withdrawalGstPercent').get();
+      if (gstSnap.exists() && Number.isFinite(Number(gstSnap.val()))) {
+        gstRate = Number(gstSnap.val()) / 100;
+      }
+    } catch (e) {
+      console.warn('Could not read withdrawalGstPercent from DB, using default:', gstRate);
+    }
+
+    const gstAmount = Number((requestedAmount * gstRate).toFixed(2));
+    const netPayoutAmount = Number((requestedAmount - gstAmount).toFixed(2));
+
+    if (netPayoutAmount <= 0) {
+      return errorResponse(res, 400, 'Net payout amount after GST must be greater than 0');
+    }
+
     const payoutKey = withdrawalId || `WD_${uid}_${Date.now()}`;
     const claimRef = db.ref(`payoutProcessedWithdrawals/${payoutKey}`);
     const claimResult = await claimRef.transaction(current => {
@@ -414,7 +434,10 @@ app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
       }
       return {
         uid,
-        amount,
+        requestedAmount,
+        gstRate,
+        gstAmount,
+        netPayoutAmount,
         upiId,
         claimedAt: admin.database.ServerValue.TIMESTAMP
       };
@@ -441,11 +464,13 @@ app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
         transfer_id: payoutKey,
         order_id: payoutKey,
         uid,
-        amount,
+        amount: netPayoutAmount,
+        gross_amount: requestedAmount,
+        gst_amount: gstAmount,
         upi_id: upiId,
         vpa: upiId,
         method,
-        remark: `Tournament withdrawal ${payoutKey}`
+        remark: `Tournament withdrawal ${payoutKey} (Net after GST)`
       }),
       signal: AbortSignal.timeout(15000)
     });
@@ -487,6 +512,10 @@ app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
     if (withdrawalId) {
       await db.ref(`withdrawals/${withdrawalId}`).update({
         status: normalizedPayoutStatus,
+        requestedAmount,
+        gstRatePercent: Number((gstRate * 100).toFixed(2)),
+        gstAmount,
+        netPayoutAmount,
         utr,
         payoutResponse: payoutData,
         updatedAt: admin.database.ServerValue.TIMESTAMP,
@@ -497,6 +526,10 @@ app.post('/api/payouts/withdraw', authenticate, async (req, res) => {
     return res.json({
       success: true,
       status: normalizedPayoutStatus,
+      requestedAmount,
+      gstRatePercent: Number((gstRate * 100).toFixed(2)),
+      gstAmount,
+      netPayoutAmount,
       utr,
       payout_id: payoutData.payout_id || payoutData.reference_id || payoutKey
     });
